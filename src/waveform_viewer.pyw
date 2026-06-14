@@ -2601,29 +2601,17 @@ class MainWindow(QMainWindow):
                     wf.plot_item.vb.setXRange(latest_x - span, latest_x, padding=0)
                     cfg.last_tracked_x = latest_x
             else:
-                # 第一次显示时，初始化合理的 X 轴范围
+                # 第一次初始化 X 轴范围
                 if not getattr(cfg, 'x_initialized', False):
-                    first_x = float(valid_x[0])
                     if self.current_mode == 'live':
-                        # 动态模式下，即刻连上可能只有1个点，强制赋予 1000 的默认跨度，避免视口过小导致画面抽搐
+                        first_x = float(valid_x[0])
+                        # 动态模式：初始可能只有1个点，给默认跨度避免抽搐
                         wf.plot_item.vb.setXRange(first_x, first_x + 1000, padding=0)
                     else:
-                        # 静态模式下，根据已有数据量限制在前 1000 个点
-                        limit = min(1000, len(valid_x) - 1)
-                        last_x = float(valid_x[limit])
-                        if last_x > first_x:
-                            wf.plot_item.vb.setXRange(first_x, last_x, padding=0)
-                        else:
-                            wf.plot_item.vb.setXRange(first_x - 1, first_x + 1, padding=0)
+                        # 静态模式：autoRange 显示全量数据，pyqtgraph 内置降采样负责渲染
+                        wf.plot_item.vb.autoRange()
                     wf.plot_item.vb.disableAutoRange(axis=pg.ViewBox.XAxis)
                     cfg.x_initialized = True
-
-        # 设置每条曲线的数据，同时收集完整 Y 数据供后续游标使用
-        # 视口矩形在曲线循环外获取一次即可（所有曲线共享同一 ViewBox）
-        v_rect = wf.plot_item.vb.viewRect()
-        vw = v_rect.width()
-        left_b = v_rect.left() - vw * 0.5
-        right_b = v_rect.right() + vw * 0.5
 
         curves_full_data: list[tuple[np.ndarray, np.ndarray]] = []
         for cc in cfg.curves:
@@ -2636,53 +2624,59 @@ class MainWindow(QMainWindow):
             # 收集 (xd, yd_full)，避免后面游标循环再次从 buffer 拉取
             curves_full_data.append((xd, yd))
 
-            start_idx = np.searchsorted(xd, left_b)
-            end_idx = np.searchsorted(xd, right_b, side='right')
+            if self.current_mode == 'live':
+                # 动态模式：数据无限增长，按视口切片 + 峰值降采样
+                v_rect = wf.plot_item.vb.viewRect()
+                vw = v_rect.width()
+                left_b = v_rect.left() - vw * 0.5
+                right_b = v_rect.right() + vw * 0.5
 
-            if start_idx < end_idx:
-                sliced_x = xd[start_idx:end_idx]
-                sliced_y = yd[start_idx:end_idx]
+                start_idx = np.searchsorted(xd, left_b)
+                end_idx = np.searchsorted(xd, right_b, side='right')
 
-                # --- 极限 NumPy 峰值降采样优化 ---
-                n_points = len(sliced_x)
-                if n_points > 10000:
-                    # 目标像素块数（4000 个块足够覆盖 4K 屏幕，画出 8000 个点构成完美包络线）
-                    target_pts = 4000
-                    chunk_size = n_points // target_pts
-                    trunc_len = chunk_size * target_pts
+                if start_idx < end_idx:
+                    sliced_x = xd[start_idx:end_idx]
+                    sliced_y = yd[start_idx:end_idx]
 
-                    # 零内存拷贝重塑二维矩阵
-                    sx_2d = sliced_x[:trunc_len].reshape(target_pts, chunk_size)
-                    sy_2d = sliced_y[:trunc_len].reshape(target_pts, chunk_size)
+                    # --- 极限 NumPy 峰值降采样优化 ---
+                    n_points = len(sliced_x)
+                    if n_points > 10000:
+                        target_pts = 4000
+                        chunk_size = n_points // target_pts
+                        trunc_len = chunk_size * target_pts
 
-                    # C 级极速取极值（100万点仅需约 1 毫秒）
-                    y_max = sy_2d.max(axis=1)
-                    y_min = sy_2d.min(axis=1)
-                    x_mid = sx_2d[:, 0]
+                        sx_2d = sliced_x[:trunc_len].reshape(target_pts, chunk_size)
+                        sy_2d = sliced_y[:trunc_len].reshape(target_pts, chunk_size)
 
-                    # 组装出完美的锯齿包络波形（min1 -> max1 -> min2 -> max2...）
-                    final_x = np.empty(target_pts * 2, dtype=np.float32)
-                    final_x[0::2] = x_mid
-                    final_x[1::2] = x_mid + 1e-6  # 微小偏移防止重叠
+                        y_max = sy_2d.max(axis=1)
+                        y_min = sy_2d.min(axis=1)
+                        x_mid = sx_2d[:, 0]
 
-                    final_y = np.empty(target_pts * 2, dtype=np.float32)
-                    final_y[0::2] = y_min
-                    final_y[1::2] = y_max
+                        final_x = np.empty(target_pts * 2, dtype=np.float32)
+                        final_x[0::2] = x_mid
+                        final_x[1::2] = x_mid + 1e-6
 
-                    if trunc_len < n_points:
-                        # 补齐尾部被 integer division 截断的残余最新数据，防止右侧出现忽大忽小的断层缺口
-                        rem_x = sliced_x[trunc_len:]
-                        rem_y = sliced_y[trunc_len:]
-                        sliced_x = np.concatenate((final_x, rem_x))
-                        sliced_y = np.concatenate((final_y, rem_y))
-                    else:
-                        sliced_x = final_x
-                        sliced_y = final_y
+                        final_y = np.empty(target_pts * 2, dtype=np.float32)
+                        final_y[0::2] = y_min
+                        final_y[1::2] = y_max
+
+                        if trunc_len < n_points:
+                            rem_x = sliced_x[trunc_len:]
+                            rem_y = sliced_y[trunc_len:]
+                            sliced_x = np.concatenate((final_x, rem_x))
+                            sliced_y = np.concatenate((final_y, rem_y))
+                        else:
+                            sliced_x = final_x
+                            sliced_y = final_y
+                else:
+                    sliced_x = xd
+                    sliced_y = yd
+
+                wf.set_curve_data(cc, sliced_x, sliced_y)
             else:
-                sliced_x = xd
-                sliced_y = yd
-
-            wf.set_curve_data(cc, sliced_x, sliced_y)
+                # 静态模式：设全量数据，pyqtgraph 内置 auto-downsample (peak)
+                # 负责按像素宽度降采样，拖拽/缩放时 GPU 级实时更新
+                wf.set_curve_data(cc, xd, yd)
 
         wf.sync_curves(cfg.curves, fg)
         
