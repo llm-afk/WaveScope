@@ -2605,12 +2605,21 @@ class MainWindow(QMainWindow):
                 if not getattr(cfg, 'x_initialized', False):
                     if self.current_mode == 'live':
                         first_x = float(valid_x[0])
-                        # 动态模式：初始可能只有1个点，给默认跨度避免抽搐
                         wf.plot_item.vb.setXRange(first_x, first_x + 1000, padding=0)
                     else:
-                        # 静态模式：autoRange 显示全量数据，pyqtgraph 内置降采样负责渲染
-                        wf.plot_item.vb.autoRange()
+                        # 静态模式：默认显示前 1000 个点，用户可自由拖拽/缩放浏览全量
+                        first_x = float(valid_x[0])
+                        limit = min(1000, len(valid_x) - 1)
+                        last_x = float(valid_x[limit])
+                        if last_x > first_x:
+                            wf.plot_item.vb.setXRange(first_x, last_x, padding=0)
+                        else:
+                            wf.plot_item.vb.setXRange(first_x - 1, first_x + 1, padding=0)
                     wf.plot_item.vb.disableAutoRange(axis=pg.ViewBox.XAxis)
+                    # 触发一次 Y 轴自动缩放
+                    wf.plot_item.vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+                    wf.plot_item.vb.updateAutoRange()
+                    wf.plot_item.vb.disableAutoRange(axis=pg.ViewBox.YAxis)
                     cfg.x_initialized = True
 
         curves_full_data: list[tuple[np.ndarray, np.ndarray]] = []
