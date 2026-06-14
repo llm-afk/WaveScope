@@ -6,9 +6,10 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.egg-info/
-dist/
+
+# PyInstaller (spec file IS tracked)
 build/
-*.spec
+dist/
 
 # IDE
 .idea/
