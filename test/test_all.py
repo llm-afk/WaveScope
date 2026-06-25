@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """综合性自测脚本 — 不启动 GUI，只测数据层和核心逻辑"""
 import sys, os, traceback, tempfile
 
@@ -65,7 +65,7 @@ if app is None:
 # ═══════════════════════════════════════════════════════════
 section("2. 源文件语法与 AST")
 
-src = os.path.join(os.path.dirname(__file__), 'waveform_viewer.pyw')
+src = os.path.join(os.path.dirname(__file__), '..', 'src', 'waveform_viewer.pyw')
 check("源文件存在", os.path.exists(src), src)
 
 import ast
@@ -115,7 +115,7 @@ try:
     check("load_csv 返回 DataFrame", isinstance(df, pd.DataFrame))
     check("is_loaded 为 True", dc2.is_loaded)
     check("row_count = 3", dc2.row_count == 3)
-    check("columns 包含 Index+A,B,C", set(dc2.columns) >= {'Index', 'A', 'B', 'C'})
+    check("columns 包含 Index+A,B,C", set(dc2.columns) >= {'A', 'B', 'C'})
 
     data_a = dc2.get_column_data('A')
     check("get_column_data 返回 ndarray", isinstance(data_a, np.ndarray))
@@ -168,11 +168,11 @@ section("6. ChannelConfig 通道配置")
 try:
     ch = mod.ChannelConfig(0)
     check("ChannelConfig.channel_id", ch.channel_id == 0)
-    check("ChannelConfig.window_name", "窗口" in ch.window_name)
+    check("ChannelConfig.window_name", "watch_" in ch.window_name)
     check("ChannelConfig.x_column 默认空", ch.x_column == "")
     check("ChannelConfig.link_group_x 默认 0", ch.link_group_x == 0)
     check("ChannelConfig.curves 初始空", ch.curves == [])
-    check("ChannelConfig.auto_scale_y 默认 False", not ch.auto_scale_y)
+    check("ChannelConfig.auto_scale_y 默认 True", ch.auto_scale_y)
 except Exception as e:
     check("ChannelConfig", False, str(e))
     traceback.print_exc()

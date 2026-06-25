@@ -2,7 +2,7 @@
 """深度 GUI 集成测试 — 创建主窗口，加载数据，测试所有轴配置"""
 import sys, os, tempfile, traceback
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 passed = 0; failed = 0
 
 def check(name, condition, detail=""):
@@ -125,7 +125,7 @@ for aidx in range(6):
     check(f"aidx={aidx} Axis 存在", ax is not None)
 
     if aidx > 0:
-        check(f"aidx={aidx} ViewBox Z=100", vb.zValue() == 100)
+        check(f"aidx={aidx} ViewBox Z=110+aidx", vb.zValue() == 110 + aidx)
 
 # ── 验证辅助轴有有效几何 ──
 print("\n=== 轴几何检查 ===")
