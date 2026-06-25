@@ -930,26 +930,48 @@ class ViewportIndicator(QWidget):
     def wheelEvent(self, event) -> None:
         bounds = self._get_bounds()
         if not bounds: return
-        
-        delta = event.angleDelta().y()
-        if delta == 0: return
-        
-        scale_factor = 0.85 if delta > 0 else 1.0 / 0.85
-        
+
+        delta_y = event.angleDelta().y()
+        delta_x = event.angleDelta().x()
+
         v_rect = self._plot_item.vb.viewRect()
         v_left = v_rect.left()
         v_right = v_rect.right()
-        new_width = v_rect.width() * scale_factor
-        
+        v_center = (v_left + v_right) / 2
+        v_width = v_rect.width()
+
+        # ── 水平滚动主导（触摸板双指水平滑动）→ 平移 X 轴 ──
+        if abs(delta_x) > abs(delta_y) and delta_x != 0:
+            pixel_delta = event.pixelDelta()
+            if not pixel_delta.isNull() and pixel_delta.x() != 0:
+                px_shift = pixel_delta.x()
+            else:
+                # angleDelta: 120 单位 ≈ 15% 视口宽度
+                px_shift = delta_x / 120.0 * self.width() * 0.15
+
+            data_per_px = v_width / max(self.width(), 1)
+            data_shift = px_shift * data_per_px
+            new_center = v_center - data_shift
+            half_w = v_width / 2
+            self._plot_item.vb.setXRange(new_center - half_w, new_center + half_w, padding=0)
+            self.manual_interact.emit()
+            event.accept()
+            return
+
+        # ── 垂直滚动 → 缩放 X 轴（原有逻辑） ──
+        if delta_y == 0: return
+
+        scale_factor = 0.85 if delta_y > 0 else 1.0 / 0.85
+        new_width = v_width * scale_factor
+
         is_tracking = not getattr(self._cfg, 'is_user_dragging', False) if hasattr(self, '_cfg') and self._cfg else False
-        
+
         if is_tracking:
             self._plot_item.vb.setXRange(v_right - new_width, v_right, padding=0)
         else:
-            v_center = (v_left + v_right) / 2
             self._plot_item.vb.setXRange(v_center - new_width / 2, v_center + new_width / 2, padding=0)
             self.manual_interact.emit()
-            
+
         event.accept()
 
     def paintEvent(self, event) -> None:
@@ -1344,13 +1366,17 @@ class WaveformPlot:
         # ── 左辅助轴 (aidx=1,2)：紧贴主左轴左侧依次向左排 ──
         left_aidx = sorted([a for a in self._axes if a in (1, 2) and self._axes[a].isVisible()])
         main_left_ax = self.plot_item.getAxis('left')
-        # 以主左轴 scene 左边界为基准
-        try:
-            ml_rect = main_left_ax.sceneBoundingRect()
-            left_edge = ml_rect.left() if ml_rect.width() > 0 else rect.left() - 36
-        except Exception:
-            left_edge = rect.left() - 36
-            
+        main_left_visible = main_left_ax.isVisible()
+        if main_left_visible:
+            try:
+                ml_rect = main_left_ax.sceneBoundingRect()
+                left_edge = ml_rect.left() if ml_rect.width() > 0 else rect.left() - 36
+            except Exception:
+                left_edge = rect.left() - 36
+        else:
+            # 主左轴隐藏时，辅助轴从 ViewBox 左边界开始，占据主左轴位置
+            left_edge = rect.left()
+
         current_left = left_edge
         for aidx in left_aidx:
             ax = self._axes[aidx]
@@ -1362,17 +1388,20 @@ class WaveformPlot:
 
         # ── 右辅助轴 (aidx=4,5)：从内建右轴/ViewBox 右边界向右依次排 ──
         right_aidx = sorted([a for a in self._axes if a >= 4 and self._axes[a].isVisible()])
-        right_edge = rect.right()
-        if 3 in self._axes:
+        main_right_ax = self.plot_item.getAxis('right')
+        main_right_visible = main_right_ax.isVisible()
+        if main_right_visible:
+            right_edge = rect.right()
             try:
-                rax = self._axes[3]
-                if rax.isVisible():
-                    r = rax.sceneBoundingRect()
-                    if r.width() > 0:
-                        right_edge = r.right()
+                r = main_right_ax.sceneBoundingRect()
+                if r.width() > 0:
+                    right_edge = r.right()
             except Exception:
                 pass
-                
+        else:
+            # 主右轴隐藏时，辅助轴从 ViewBox 右边界开始
+            right_edge = rect.right()
+
         current_right = right_edge
         for aidx in right_aidx:
             ax = self._axes[aidx]
@@ -1383,9 +1412,11 @@ class WaveformPlot:
             total_right_w += w
 
         # 动态调整 PlotItem 的边距，确保额外的辅助轴不会被窗口边界裁切（遮挡）
-        # 基础边距：左 15, 右 25
-        new_left = 15 + total_left_w
-        new_right = 25 + total_right_w
+        # 主左/右轴隐藏时不叠加基础边距，避免死空间
+        base_left = 15 if main_left_visible else 2
+        base_right = 25 if main_right_visible else 2
+        new_left = base_left + total_left_w
+        new_right = base_right + total_right_w
         left, top, right, bottom = self.plot_item.layout.getContentsMargins()
         if left != new_left or right != new_right:
             self.plot_item.layout.setContentsMargins(new_left, 15, new_right, 15)
@@ -1404,15 +1435,17 @@ class WaveformPlot:
         self.plot_item.scene().addItem(vb)
         vb.setXLink(self._vbs[0])
         vb.sigYRangeChanged.connect(self._on_main_vb_resized)
+        # 新轴创建时关闭 Y autoRange，避免 pyqtgraph 用全量数据撑开 Y 轴
+        vb.disableAutoRange(axis=pg.ViewBox.YAxis)
 
         if aidx == 3:
             self.plot_item.showAxis('right', True)
             ax = self.plot_item.getAxis('right')
         elif aidx in (1, 2):
-            ax = pg.AxisItem('left')
+            ax = LShapeAxis('left')
             ax.setZValue(50); self.plot_item.scene().addItem(ax)
         elif aidx >= 4:
-            ax = pg.AxisItem('right')
+            ax = LShapeAxis('right')
             ax.setZValue(50); self.plot_item.scene().addItem(ax)
         else:
             return
@@ -1475,6 +1508,47 @@ class WaveformPlot:
         self.plot_item.scene()._orig_wheel(ev)
         for a in hidden:
             self._vbs[a].show()
+
+    def _smart_y_auto_range(self, aidx: int,
+                            x_data: np.ndarray,
+                            y_data: np.ndarray) -> None:
+        """从当前 X 视口左边界开始取最多 1000 个点计算 Y 轴范围。
+
+        与全局 Auto 按钮保持一致的 searchsorted + slice 策略，
+        避免全量数据（百万行级）导致波形被压缩成一条线。
+        """
+        vb = self._vbs.get(aidx)
+        if vb is None or len(x_data) == 0 or len(y_data) == 0:
+            return
+
+        main_vb = self._vbs.get(0)
+        if main_vb is None:
+            return
+
+        AUTO_LIMIT = 1000
+
+        # 以当前视口左边界为起点
+        view_x_left = main_vb.viewRange()[0][0]
+
+        # searchsorted 定位 + slice（与 _on_auto_requested 一致）
+        start_idx = np.searchsorted(x_data, view_x_left)
+        if start_idx >= len(x_data):
+            start_idx = max(0, len(x_data) - AUTO_LIMIT)
+        end_idx = min(start_idx + AUTO_LIMIT, len(x_data))
+        y_view = y_data[start_idx:end_idx]
+
+        if len(y_view) == 0:
+            return
+
+        y_min = float(np.min(y_view))
+        y_max = float(np.max(y_view))
+
+        if y_max - y_min < 1e-12:
+            y_max = y_min + 1.0
+
+        # 显式关闭 autoRange 防止 pyqtgraph 用全量数据覆盖
+        vb.disableAutoRange(axis=pg.ViewBox.YAxis)
+        vb.setYRange(y_min, y_max, padding=0.05)
 
     def set_curve_data(self, cc: CurveConfig, x_data: np.ndarray,
                        y_data: np.ndarray) -> None:
@@ -1556,14 +1630,10 @@ class WaveformPlot:
         if y_column_changed:
             cc._last_y_column = cc.y_column
 
-        # 处理 Y 轴自动缩放（基于当前可见的 X 范围）
+        # 处理 Y 轴自动缩放（仅基于当前 X 视口内的数据点）
         needs_y_auto = switched_vb or y_column_changed or getattr(self._vbs[aidx], '_needs_initial_y_range', False)
         if needs_y_auto:
-            was_auto = self._vbs[aidx].state['autoRange'][1]
-            self._vbs[aidx].enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-            self._vbs[aidx].updateAutoRange()
-            if not was_auto:
-                self._vbs[aidx].disableAutoRange(axis=pg.ViewBox.YAxis)
+            self._smart_y_auto_range(aidx, x, y)
             self._vbs[aidx]._needs_initial_y_range = False
 
         # 切换 ViewBox 后强制刷新，确保曲线立即可见
@@ -1584,13 +1654,41 @@ class WaveformPlot:
         layout_key = tuple(sorted(active_aidx))
         layout_changed = (layout_key != getattr(self, '_last_layout_key', None))
 
+        # 辅助轴晋升：主左/右轴无曲线时，将活跃辅助 ViewBox 绑到主轴上，
+        # 始终由 pyqtgraph 原生布局管理轴位置，避免手动 setGeometry 的视觉偏差。
+        left_promoted: int | None = None
+        right_promoted: int | None = None
+        if 0 not in active_aidx:
+            for aux in (1, 2):
+                if aux in active_aidx:
+                    left_promoted = aux; break
+        if 3 not in active_aidx:
+            for aux in (4, 5):
+                if aux in active_aidx:
+                    right_promoted = aux; break
+
         for aidx, ax in self._axes.items():
             if aidx not in active_aidx:
                 vb = self._vbs.get(aidx)
                 if vb:
                     vb._needs_initial_y_range = True
                     if aidx != 0:
-                        vb.hide()   # v3.6: 隐藏不活跃的辅助 ViewBox，防止幽灵遮挡鼠标
+                        vb.hide()
+
+                # 主左轴被晋升：不隐藏，绑定到辅助 ViewBox
+                if aidx == 0 and left_promoted is not None:
+                    self.plot_item.getAxis('left').linkToView(self._vbs[left_promoted])
+                    self.plot_item.showAxis('left', True)
+                    self._vbs[left_promoted].show()
+                    self._axes[left_promoted].hide()  # 隐藏辅助轴，主轴代其显示
+                    continue
+                # 主右轴被晋升
+                elif aidx == 3 and right_promoted is not None:
+                    self.plot_item.getAxis('right').linkToView(self._vbs[right_promoted])
+                    self.plot_item.showAxis('right', True)
+                    self._vbs[right_promoted].show()
+                    self._axes[right_promoted].hide()
+                    continue
 
                 if aidx == 0:
                     self.plot_item.showAxis('left', False)
@@ -1600,20 +1698,31 @@ class WaveformPlot:
                     ax.hide()
                 continue
 
+            # 被晋升的辅助轴跳过（已由主轴接管）
+            if (left_promoted is not None and aidx == left_promoted) or \
+               (right_promoted is not None and aidx == right_promoted):
+                continue
+
             if aidx == 0:
                 self.plot_item.showAxis('left', True)
+                # 从晋升状态恢复：重新绑回主 ViewBox
+                if left_promoted is None:
+                    self.plot_item.getAxis('left').linkToView(self._vbs[0])
             elif aidx == 3:
                 self.plot_item.showAxis('right', True)
+                # 从晋升状态恢复
+                if right_promoted is None:
+                    self.plot_item.getAxis('right').linkToView(self._vbs[3])
                 vb = self._vbs.get(aidx)
                 if vb:
-                    vb.show()   # v3.6: 重新显示右轴 ViewBox
+                    vb.show()
                     if 0 in self._vbs:
                         vb.setXLink(self._vbs[0])
             else:
                 ax.show()
                 vb = self._vbs.get(aidx)
                 if vb:
-                    vb.show()   # v3.6: 重新显示辅助 ViewBox
+                    vb.show()
                     if 0 in self._vbs:
                         vb.setXLink(self._vbs[0])  # 副轴 X 永远跟随主轴
 
@@ -1622,7 +1731,13 @@ class WaveformPlot:
                 ax.setTextPen(fg)
             else:
                 # 使用该轴第一条曲线的颜色
-                first_cc = next((cc for cc in active_curves if cc.axis_index == aidx), None)
+                target_aidx = aidx
+                # 晋升轴：用实际有曲线的那个 axis_index 来取颜色
+                if aidx == 0 and left_promoted is not None:
+                    target_aidx = left_promoted
+                elif aidx == 3 and right_promoted is not None:
+                    target_aidx = right_promoted
+                first_cc = next((cc for cc in active_curves if cc.axis_index == target_aidx), None)
                 if first_cc:
                     c = QColor(first_cc.color)
                     c.setAlpha(255)
@@ -1631,6 +1746,34 @@ class WaveformPlot:
                 else:
                     ax.setPen(fg)
                     ax.setTextPen(fg)
+
+        # 晋升轴颜色：被跳过的主动轴需要单独设色
+        if left_promoted is not None:
+            if is_single_axis:
+                self.plot_item.getAxis('left').setPen(fg)
+                self.plot_item.getAxis('left').setTextPen(fg)
+            else:
+                first_cc = next((cc for cc in active_curves if cc.axis_index == left_promoted), None)
+                if first_cc:
+                    c = QColor(first_cc.color); c.setAlpha(255)
+                    self.plot_item.getAxis('left').setPen(c)
+                    self.plot_item.getAxis('left').setTextPen(c)
+                else:
+                    self.plot_item.getAxis('left').setPen(fg)
+                    self.plot_item.getAxis('left').setTextPen(fg)
+        if right_promoted is not None:
+            if is_single_axis:
+                self.plot_item.getAxis('right').setPen(fg)
+                self.plot_item.getAxis('right').setTextPen(fg)
+            else:
+                first_cc = next((cc for cc in active_curves if cc.axis_index == right_promoted), None)
+                if first_cc:
+                    c = QColor(first_cc.color); c.setAlpha(255)
+                    self.plot_item.getAxis('right').setPen(c)
+                    self.plot_item.getAxis('right').setTextPen(c)
+                else:
+                    self.plot_item.getAxis('right').setPen(fg)
+                    self.plot_item.getAxis('right').setTextPen(fg)
 
         # 仅在轴布局变化时重新计算 scene 轴位置（sceneBoundingRect 成本高）
         if layout_changed:
@@ -1810,6 +1953,26 @@ class MainWindow(QMainWindow):
         self.act_grid.toggled.connect(self._on_toggle_grid)
         vm.addAction(self.act_grid)
 
+        # ── 刷新率子菜单 ──
+        rate_menu = vm.addMenu("波形刷新率")
+        self._refresh_rates: dict[str, int] = {
+            "10 Hz  (100ms)": 100,
+            "15 Hz  ( 66ms)": 66,
+            "30 Hz  ( 33ms) — 默认": 33,
+            "60 Hz  ( 16ms)": 16,
+            "120 Hz (  8ms)": 8,
+        }
+        self._refresh_interval_ms: int = 33
+        self._rate_actions: dict[str, QAction] = {}
+        rate_group = QAction(self); rate_group.setVisible(False)  # group placeholder
+        for label, interval in self._refresh_rates.items():
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(interval == self._refresh_interval_ms)
+            act.triggered.connect(lambda _checked, iv=interval: self._on_refresh_rate(iv))
+            rate_menu.addAction(act)
+            self._rate_actions[interval] = act
+
         # ── 光标菜单 ──
         cm = mb.addMenu("光标")
 
@@ -1916,6 +2079,16 @@ class MainWindow(QMainWindow):
         alpha = self.PLOT_THEME[self._current_theme]["grid_alpha"]
         for wf in self._waveform_plots.values():
             wf.plot_item.showGrid(x=on, y=on, alpha=alpha)
+
+    def _on_refresh_rate(self, interval_ms: int) -> None:
+        """切换波形绘制刷新率（仅实时模式生效）"""
+        self._refresh_interval_ms = interval_ms
+        # 同步菜单勾选
+        for iv, act in self._rate_actions.items():
+            act.setChecked(iv == interval_ms)
+        # 如果实时定时器正在运行，重启以应用新间隔
+        if self.live_timer.isActive():
+            self.live_timer.start(interval_ms)
 
     @Slot(bool)
     def _on_toggle_cursor(self, on: bool) -> None:
@@ -2125,7 +2298,7 @@ class MainWindow(QMainWindow):
             self.receiver.start()
             self.btn_connect.setText("⏹ 断开连接")
             self.btn_connect.setStyleSheet("color: red; font-weight: bold;")
-            self.live_timer.start(33)
+            self.live_timer.start(self._refresh_interval_ms)
             
     def _on_connection_error(self, msg: str) -> None:
         QMessageBox.warning(self, "连接错误", msg)
@@ -2367,12 +2540,17 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_auto_requested(self, cid: int) -> None:
-        """Auto: 手动计算全部数据范围并直接设置视口，不依赖 autoRange 状态机"""
+        """Auto: 从当前 X 视口位置开始取最多 1000 个点，计算 X/Y 范围并设置视口"""
         if cid not in self._waveform_plots or cid not in self._channels:
             return
         wf = self._waveform_plots[cid]
         cfg = self._channels[cid]
         vb = wf.plot_item.vb
+
+        AUTO_LIMIT = 1000
+
+        # 以当前视口左边界为起点
+        view_x_left = vb.viewRange()[0][0]
 
         # ── 收集所有曲线的 (x, y) 数据，按 axis_index 分组 Y ──
         x_all = []
@@ -2391,13 +2569,20 @@ class MainWindow(QMainWindow):
             mask = np.isfinite(xd) & np.isfinite(yd)
             if not mask.any():
                 continue
-            x_all.append(xd[mask])
-            y_by_aidx.setdefault(cc.axis_index, []).append(yd[mask])
+            x_clean = xd[mask]
+            y_clean = yd[mask]
+            # 从当前视口左边界开始，取最近 AUTO_LIMIT 个点
+            start_idx = np.searchsorted(x_clean, view_x_left)
+            if start_idx >= len(x_clean):
+                start_idx = max(0, len(x_clean) - AUTO_LIMIT)
+            end_idx = min(start_idx + AUTO_LIMIT, len(x_clean))
+            x_all.append(x_clean[start_idx:end_idx])
+            y_by_aidx.setdefault(cc.axis_index, []).append(y_clean[start_idx:end_idx])
 
         if not x_all:
             return
 
-        # ── X 轴：全局 min/max ──
+        # ── X 轴：视口起点开始的 AUTO_LIMIT 个点 min/max ──
         x_cat = np.concatenate(x_all)
         x_min = float(x_cat.min())
         x_max = float(x_cat.max())
@@ -2406,7 +2591,7 @@ class MainWindow(QMainWindow):
         vb.setXRange(x_min, x_max, padding=0.02)
         vb.disableAutoRange(axis=pg.ViewBox.XAxis)
 
-        # ── Y 轴：每个 axis 独立计算 ──
+        # ── Y 轴：每个 axis 独立计算（同样只取对应切片） ──
         for aidx, y_arrs in y_by_aidx.items():
             y_cat = np.concatenate(y_arrs)
             y_min = float(y_cat.min())
@@ -2617,7 +2802,7 @@ class MainWindow(QMainWindow):
 
         if not self._channel_order: return
 
-        # X 轴：按 link_group_x 分组（v3.5.1: 双向联动）
+        # X 轴：按 link_group_x 分组（v3.7: 统一 handler 避免信号环路闪退）
         xg: dict[int, list[int]] = {}
         for cid in self._channel_order:
             g = self._channels[cid].link_group_x
@@ -2625,14 +2810,26 @@ class MainWindow(QMainWindow):
                 xg.setdefault(g, []).append(cid)
         for g, mem in xg.items():
             if len(mem) >= 2:
-                mv = self._waveform_plots[mem[0]].plot_item.getViewBox()
-                for cid in mem[1:]:
-                    self._waveform_plots[cid].plot_item.setXLink(mv)
-                    # 反向连接：主 ViewBox 也跟随从 ViewBox 的范围变化
-                    slave_vb = self._waveform_plots[cid].plot_item.getViewBox()
-                    _wrap = lambda _vb, rng, _mv=mv: _mv.setXRange(*rng, padding=0)
-                    slave_vb.sigXRangeChanged.connect(_wrap)
-                    self._x_link_reverse_connections.append((slave_vb, _wrap))
+                # 收集同组所有 ViewBox
+                vbs: dict[int, object] = {}
+                for cid in mem:
+                    vbs[cid] = self._waveform_plots[cid].plot_item.getViewBox()
+
+                # 每个 ViewBox 绑定统一 handler：变化时同步到组内其他 ViewBox
+                for src_cid, src_vb in vbs.items():
+                    def _make_xlink_handler(s_cid, s_vb, all_vbs):
+                        def handler(_emitting_vb, rng):
+                            for t_cid, t_vb in all_vbs.items():
+                                if t_cid == s_cid:
+                                    continue
+                                cur = t_vb.viewRange()[0]
+                                if abs(cur[0] - rng[0]) > 1e-9 or abs(cur[1] - rng[1]) > 1e-9:
+                                    t_vb.setXRange(*rng, padding=0)
+                        return handler
+
+                    wrapper = _make_xlink_handler(src_cid, src_vb, vbs)
+                    src_vb.sigXRangeChanged.connect(wrapper)
+                    self._x_link_reverse_connections.append((src_vb, wrapper))
 
         # Y 轴：按 link_group_y 分组
         yg: dict[int, list[int]] = {}
@@ -2747,10 +2944,6 @@ class MainWindow(QMainWindow):
                         else:
                             wf.plot_item.vb.setXRange(first_x - 1, first_x + 1, padding=0)
                     wf.plot_item.vb.disableAutoRange(axis=pg.ViewBox.XAxis)
-                    # 触发一次 Y 轴自动缩放
-                    wf.plot_item.vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-                    wf.plot_item.vb.updateAutoRange()
-                    wf.plot_item.vb.disableAutoRange(axis=pg.ViewBox.YAxis)
                     cfg.x_initialized = True
 
         curves_full_data: list[tuple[np.ndarray, np.ndarray]] = []
