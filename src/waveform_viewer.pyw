@@ -1310,12 +1310,12 @@ class WaveformPlot:
     def __init__(self, plot_item: pg.PlotItem) -> None:
         self.plot_item: pg.PlotItem = plot_item
         self._items: dict[int, pg.PlotDataItem] = {}
-        
+
         self.plot_item.showGrid(x=False, y=False)
         self.plot_item.setTitle(None)
         if self.plot_item.legend is not None:
             self.plot_item.legend.hide()
-            
+
         self.plot_item.showAxis('top', False)
         self.plot_item.getAxis('left').setLabel('')
         self.plot_item.getAxis('bottom').setLabel('')
@@ -1324,6 +1324,8 @@ class WaveformPlot:
         self.plot_item.vb._needs_initial_y_range = True
         self._axes: dict[int, pg.AxisItem] = {0: self.plot_item.getAxis('left')}
         self._active_axis: int = 0
+        self._offline_full_range: bool = True  # 静态 CSV 模式下使用全局数据完整范围
+        self._vb_switched: bool = False        # 本轮更新中是否有曲线切换了 ViewBox
 
         # v3.6: 悬停自动切换活跃轴
         self._hover_proxy = pg.SignalProxy(
@@ -1512,30 +1514,31 @@ class WaveformPlot:
     def _smart_y_auto_range(self, aidx: int,
                             x_data: np.ndarray,
                             y_data: np.ndarray) -> None:
-        """从当前 X 视口左边界开始取最多 1000 个点计算 Y 轴范围。
+        """计算 Y 轴范围。
 
-        与全局 Auto 按钮保持一致的 searchsorted + slice 策略，
-        避免全量数据（百万行级）导致波形被压缩成一条线。
+        若 _offline_full_range 为 True（静态 CSV 模式）则使用全局数据完整范围；
+        否则从当前 X 视口左边界开始取最多 1000 个点，与全局 Auto 按钮策略一致。
         """
         vb = self._vbs.get(aidx)
         if vb is None or len(x_data) == 0 or len(y_data) == 0:
             return
 
-        main_vb = self._vbs.get(0)
-        if main_vb is None:
-            return
+        if self._offline_full_range:
+            # 静态 CSV 模式：使用全局数据完整范围
+            y_view = y_data
+        else:
+            # 动态接收模式：从当前视口左边界开始取最多 1000 个点
+            main_vb = self._vbs.get(0)
+            if main_vb is None:
+                return
 
-        AUTO_LIMIT = 1000
-
-        # 以当前视口左边界为起点
-        view_x_left = main_vb.viewRange()[0][0]
-
-        # searchsorted 定位 + slice（与 _on_auto_requested 一致）
-        start_idx = np.searchsorted(x_data, view_x_left)
-        if start_idx >= len(x_data):
-            start_idx = max(0, len(x_data) - AUTO_LIMIT)
-        end_idx = min(start_idx + AUTO_LIMIT, len(x_data))
-        y_view = y_data[start_idx:end_idx]
+            AUTO_LIMIT = 1000
+            view_x_left = main_vb.viewRange()[0][0]
+            start_idx = np.searchsorted(x_data, view_x_left)
+            if start_idx >= len(x_data):
+                start_idx = max(0, len(x_data) - AUTO_LIMIT)
+            end_idx = min(start_idx + AUTO_LIMIT, len(x_data))
+            y_view = y_data[start_idx:end_idx]
 
         if len(y_view) == 0:
             return
@@ -1630,8 +1633,13 @@ class WaveformPlot:
         if y_column_changed:
             cc._last_y_column = cc.y_column
 
+        # 记录 ViewBox 切换（由外部 _update_single_plot 统一触发 auto，与全局 Auto 按钮一致）
+        if switched_vb:
+            self._vb_switched = True
+
         # 处理 Y 轴自动缩放（仅基于当前 X 视口内的数据点）
-        needs_y_auto = switched_vb or y_column_changed or getattr(self._vbs[aidx], '_needs_initial_y_range', False)
+        # 注意：ViewBox 切换不再触发局部 auto，改为外部统一调用 _on_auto_requested
+        needs_y_auto = y_column_changed or getattr(self._vbs[aidx], '_needs_initial_y_range', False)
         if needs_y_auto:
             self._smart_y_auto_range(aidx, x, y)
             self._vbs[aidx]._needs_initial_y_range = False
@@ -2263,6 +2271,10 @@ class MainWindow(QMainWindow):
             self.act_live.setChecked(True)
             self.wg_offline.hide()
             self.wg_live.show()
+        # 同步所有波形窗口的 full range 模式
+        is_offline = (mode == 'offline')
+        for wf in self._waveform_plots.values():
+            wf._offline_full_range = is_offline
 
     @Slot(str)
     def _on_protocol_changed(self, protocol: str) -> None:
@@ -2447,6 +2459,7 @@ class MainWindow(QMainWindow):
         pi.getAxis('left').setWidth(None)
         pi.getAxis('bottom').setHeight(24)
         wf = WaveformPlot(pi); self._waveform_plots[cid] = wf
+        wf._offline_full_range = (self.current_mode == 'offline')
         self._plot_widgets[cid] = pw
 
         # v3.6: 全局滚轮拦截（只装一次，所有通道共享）
@@ -2540,17 +2553,19 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _on_auto_requested(self, cid: int) -> None:
-        """Auto: 从当前 X 视口位置开始取最多 1000 个点，计算 X/Y 范围并设置视口"""
+        """Auto: 计算 X/Y 范围并设置视口。
+
+        静态 CSV 模式（offline）：使用全局数据完整范围，一次展示全部数据。
+        动态接收模式（live）：从当前 X 视口位置开始取最多 1000 个点。
+        """
         if cid not in self._waveform_plots or cid not in self._channels:
             return
         wf = self._waveform_plots[cid]
         cfg = self._channels[cid]
         vb = wf.plot_item.vb
 
+        is_offline = (self.current_mode == 'offline')
         AUTO_LIMIT = 1000
-
-        # 以当前视口左边界为起点
-        view_x_left = vb.viewRange()[0][0]
 
         # ── 收集所有曲线的 (x, y) 数据，按 axis_index 分组 Y ──
         x_all = []
@@ -2571,18 +2586,25 @@ class MainWindow(QMainWindow):
                 continue
             x_clean = xd[mask]
             y_clean = yd[mask]
-            # 从当前视口左边界开始，取最近 AUTO_LIMIT 个点
-            start_idx = np.searchsorted(x_clean, view_x_left)
-            if start_idx >= len(x_clean):
-                start_idx = max(0, len(x_clean) - AUTO_LIMIT)
-            end_idx = min(start_idx + AUTO_LIMIT, len(x_clean))
-            x_all.append(x_clean[start_idx:end_idx])
-            y_by_aidx.setdefault(cc.axis_index, []).append(y_clean[start_idx:end_idx])
+
+            if is_offline:
+                # 静态 CSV 模式：使用全局数据完整范围
+                x_all.append(x_clean)
+                y_by_aidx.setdefault(cc.axis_index, []).append(y_clean)
+            else:
+                # 动态接收模式：从当前视口左边界开始，取最近 AUTO_LIMIT 个点
+                view_x_left = vb.viewRange()[0][0]
+                start_idx = np.searchsorted(x_clean, view_x_left)
+                if start_idx >= len(x_clean):
+                    start_idx = max(0, len(x_clean) - AUTO_LIMIT)
+                end_idx = min(start_idx + AUTO_LIMIT, len(x_clean))
+                x_all.append(x_clean[start_idx:end_idx])
+                y_by_aidx.setdefault(cc.axis_index, []).append(y_clean[start_idx:end_idx])
 
         if not x_all:
             return
 
-        # ── X 轴：视口起点开始的 AUTO_LIMIT 个点 min/max ──
+        # ── X 轴：min/max 范围 ──
         x_cat = np.concatenate(x_all)
         x_min = float(x_cat.min())
         x_max = float(x_cat.max())
@@ -2591,7 +2613,7 @@ class MainWindow(QMainWindow):
         vb.setXRange(x_min, x_max, padding=0.02)
         vb.disableAutoRange(axis=pg.ViewBox.XAxis)
 
-        # ── Y 轴：每个 axis 独立计算（同样只取对应切片） ──
+        # ── Y 轴：每个 axis 独立计算 ──
         for aidx, y_arrs in y_by_aidx.items():
             y_cat = np.concatenate(y_arrs)
             y_min = float(y_cat.min())
@@ -3012,7 +3034,13 @@ class MainWindow(QMainWindow):
                 wf.set_curve_data(cc, xd, yd)
 
         wf.sync_curves(cfg.curves, fg)
-        
+
+        # 若本轮有曲线切换了 ViewBox（如从左侧轴切到右侧轴），
+        # 触发与全局 Auto 按钮一致的全量 auto，而非局部 _smart_y_auto_range
+        if wf._vb_switched:
+            wf._vb_switched = False
+            self._on_auto_requested(cid)
+
         if not getattr(cfg, 'y_initialized_after_clear', True):
             if cfg.auto_scale_y:
                 panel = self._channel_panels.get(cid)
