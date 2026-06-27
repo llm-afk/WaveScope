@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- WaveScope — 传感器数据波形分析工具  v3.5
+ WaveScope — 传感器数据波形分析工具  v3.9
 ================================================================================
  基于 PySide6 + PyQtGraph + Pandas 构建。
 
@@ -23,11 +23,12 @@
 """
 
 import sys
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QThread
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QThread, QObject, QEvent
 from PySide6.QtGui import QColor, QAction, QIcon, QPalette, QPainter
 import socket
 import struct
@@ -75,6 +76,7 @@ class DataCenter:
     def __init__(self) -> None:
         self._df: pd.DataFrame | None = None
         self._file_path: str | None = None
+        self._cache: dict[str, np.ndarray] = {}  # v3.9: 列数据缓存，避免重复 to_numpy
 
     @property
     def is_loaded(self) -> bool:
@@ -113,12 +115,18 @@ class DataCenter:
 
         self._df = df
         self._file_path = file_path
+        self._cache.clear()  # 新文件加载，清空旧缓存
         return df
 
     def get_column_data(self, col_name: str) -> np.ndarray:
+        # v3.9: 缓存 pandas→numpy 转换结果，避免每次 config change 都重新转换
+        if col_name in self._cache:
+            return self._cache[col_name]
         if self._df is None or col_name not in self._df.columns:
             return np.array([], dtype=np.float32)
-        return self._df[col_name].to_numpy(dtype=np.float32, na_value=np.nan)
+        arr = self._df[col_name].to_numpy(dtype=np.float32, na_value=np.nan)
+        self._cache[col_name] = arr
+        return arr
 
 
 # ==============================================================================
@@ -910,7 +918,7 @@ class ViewportIndicator(QWidget):
             new_width = self._drag_start_view_width * scale
             if new_width < 1e-9: new_width = 1e-9
             
-            is_tracking = not getattr(self._cfg, 'is_user_dragging', False) if hasattr(self, '_cfg') and self._cfg else False
+            is_tracking = not getattr(self._cfg, '_free_mode', False) if hasattr(self, '_cfg') and self._cfg else False
             
             if is_tracking:
                 right_edge = self._drag_start_center_x + self._drag_start_view_width / 2
@@ -964,7 +972,7 @@ class ViewportIndicator(QWidget):
         scale_factor = 0.85 if delta_y > 0 else 1.0 / 0.85
         new_width = v_width * scale_factor
 
-        is_tracking = not getattr(self._cfg, 'is_user_dragging', False) if hasattr(self, '_cfg') and self._cfg else False
+        is_tracking = not getattr(self._cfg, '_free_mode', False) if hasattr(self, '_cfg') and self._cfg else False
 
         if is_tracking:
             self._plot_item.vb.setXRange(v_right - new_width, v_right, padding=0)
@@ -1144,8 +1152,12 @@ class ChannelControlPanel(QGroupBox):
         self.indicator = ViewportIndicator(wf, self._cfg)
         self.layout().addWidget(self.indicator)
 
+        # v3.9: 标记初始化进行中，防止 _on_y_range_changed 在 _init_auto_range 之前误关 auto
+        self._init_pending = True
+
         def _init_auto_range():
             if not getattr(self, '_wf', None): return
+            self._init_pending = False
             for vb in wf._vbs.values():
                 vb.setAutoVisible(x=False, y=True)
                 if self._cfg.auto_scale_y:
@@ -1170,7 +1182,10 @@ class ChannelControlPanel(QGroupBox):
     def _on_y_range_changed(self) -> None:
         if getattr(self, '_wf', None) is None:
             return
-            
+        # v3.9: 初始化期间（_init_auto_range 延迟执行前）忽略 auto 状态变化，防止误关
+        if getattr(self, '_init_pending', False):
+            return
+
         # 检查主 ViewBox 的原生 autoRange 状态，如果被用户交互关闭了则同步 UI
         is_auto = self._vb.state['autoRange'][1]
         if not is_auto and self._cfg.auto_scale_y:
@@ -1280,6 +1295,16 @@ class LShapeAxis(pg.AxisItem):
             if current < self.AXIS_MIN_SIZE:
                 self.setMaximumWidth(self.AXIS_MIN_SIZE)
                 self.setMinimumWidth(self.AXIS_MIN_SIZE)
+
+    def tickStrings(self, values, scale, spacing):
+        """v3.9: 大间距标签舍入到 100 或 10 的整数倍，视觉稳定不闪烁。"""
+        if spacing >= 200:
+            return [str(int(round(v / 100) * 100)) for v in values]
+        elif spacing >= 50:
+            return [str(int(round(v / 10) * 10)) for v in values]
+        elif spacing >= 1:
+            return [str(int(round(v))) for v in values]
+        return super().tickStrings(values, scale, spacing)
 
     def tickValues(self, minVal, maxVal, size):
         """在默认刻度的每个间距中间额外插入一个刻度。"""
@@ -1549,15 +1574,16 @@ class WaveformPlot:
         if y_max - y_min < 1e-12:
             y_max = y_min + 1.0
 
-        # 显式关闭 autoRange 防止 pyqtgraph 用全量数据覆盖
+        # 先关闭 autoRange 再 setYRange，防止 pyqtgraph 用全量数据撑开 Y 轴
+        # v3.9: 动态模式下 _init_auto_range (100ms 延迟) 会重新开启 auto
         vb.disableAutoRange(axis=pg.ViewBox.YAxis)
         vb.setYRange(y_min, y_max, padding=0.05)
 
     def set_curve_data(self, cc: CurveConfig, x_data: np.ndarray,
-                       y_data: np.ndarray) -> None:
+                       y_data: np.ndarray, validated: bool = False) -> None:
         ci = cc.curve_index
         aidx = cc.axis_index
-        
+
         if len(x_data) == 0 or len(y_data) == 0:
             return
 
@@ -1565,11 +1591,16 @@ class WaveformPlot:
         # 性能优化：仅当数据是底层环形缓冲区的 View 时（未满状态）才强制拷贝，满状态的 numpy slice 本身就是独立内存，直接复用以节约 50% 内存带宽
         x = x_data[:ml].copy() if not x_data.flags.owndata else x_data[:ml]
         y = y_data[:ml].copy() if not y_data.flags.owndata else y_data[:ml]
-        
-        mask = np.isfinite(x) & np.isfinite(y)
-        x, y = x[mask], y[mask]
-        if len(x) == 0:
-            return
+
+        if validated:
+            # 动态模式热路径：数据已知 finite（二进制 float32 解析 + 时间索引），跳过 isfinite 扫描和二次拷贝
+            if len(x) == 0:
+                return
+        else:
+            mask = np.isfinite(x) & np.isfinite(y)
+            x, y = x[mask], y[mask]
+            if len(x) == 0:
+                return
 
         self._ensure_axis(aidx, cc)
 
@@ -1650,6 +1681,13 @@ class WaveformPlot:
 
     def sync_curves(self, curves: list[CurveConfig], fg: str) -> None:
         """移除已删除曲线，autoRange。更新多轴颜色。"""
+        # v3.9: 指纹缓存 — 曲线配置未变时跳过轴管理，避免每帧 QColor 构造和 Qt 调用
+        _fp = (fg, tuple((cc.curve_index, cc.axis_index, getattr(cc, 'visible', True))
+                         for cc in curves if cc.y_column))
+        if _fp == getattr(self, '_last_sync_fp', None):
+            return
+        self._last_sync_fp = _fp
+
         active = {cc.curve_index for cc in curves if cc.y_column}
         for ci in set(self._items.keys()) - active:
             self._remove(ci)
@@ -1809,13 +1847,14 @@ class WaveformPlot:
 # ==============================================================================
 class MainWindow(QMainWindow):
     """
-    WaveScope 主窗口 v3.5。
+    WaveScope 主窗口 v3.9。
 
-    新特性：
-      · 波形窗口使用 QMdiArea 承载，可自由拖拽/缩放/排列（无吸附，不挤占控制面板）
-      · 菜单栏 → 光标 → 十字追踪光标 + 多窗口同步
-      · 联动组下拉（组 A~D）支持多套独立 X/Y 轴绑定
-      · 线径参数统一控制线宽和散点大小，默认点线结合模式
+    v3.9 动态模式性能优化：
+      · 视口切片索引每通道只算一次，所有曲线复用（消除 N×searchsorted）
+      · 跳过 isfinite 全量扫描（动态数据已知 clean）
+      · pre-allocated 降采样缓冲区复用
+      · sync_curves 指纹缓存，轴配置不变时跳过 QColor 构造
+      · set_curve_data validated 快路径，跳过二次 isfinite + mask 拷贝
     """
 
     def __init__(self) -> None:
@@ -1963,23 +2002,42 @@ class MainWindow(QMainWindow):
 
         # ── 刷新率子菜单 ──
         rate_menu = vm.addMenu("波形刷新率")
-        self._refresh_rates: dict[str, int] = {
-            "10 Hz  (100ms)": 100,
-            "15 Hz  ( 66ms)": 66,
-            "30 Hz  ( 33ms) — 默认": 33,
-            "60 Hz  ( 16ms)": 16,
-            "120 Hz (  8ms)": 8,
-        }
+        self._refresh_auto: bool = True  # v3.9: 默认自动跟随显示器刷新率
         self._refresh_interval_ms: int = 33
-        self._rate_actions: dict[str, QAction] = {}
-        rate_group = QAction(self); rate_group.setVisible(False)  # group placeholder
-        for label, interval in self._refresh_rates.items():
+        self._rate_actions: dict[int, QAction] = {}
+
+        # 自动选项
+        screen_hz = int(round(QApplication.primaryScreen().refreshRate()))
+        self._monitor_hz = max(1, screen_hz)
+        act_auto = QAction(f"自动 ({self._monitor_hz} Hz)", self)
+        act_auto.setCheckable(True); act_auto.setChecked(True)
+        act_auto.triggered.connect(lambda: self._on_refresh_auto())
+        rate_menu.addAction(act_auto)
+        self._act_refresh_auto = act_auto
+        rate_menu.addSeparator()
+
+        # v3.9: 扩展手动选项 5~240 Hz
+        for hz, interval in [
+            (5, 200), (10, 100), (15, 67), (20, 50),
+            (24, 42), (30, 33), (48, 21), (60, 17),
+            (75, 13), (90, 11), (120, 8), (144, 7),
+            (165, 6), (240, 4),
+        ]:
+            label = f"{hz} Hz  ({interval}ms)"
             act = QAction(label, self)
-            act.setCheckable(True)
-            act.setChecked(interval == self._refresh_interval_ms)
+            act.setCheckable(True); act.setChecked(False)
             act.triggered.connect(lambda _checked, iv=interval: self._on_refresh_rate(iv))
             rate_menu.addAction(act)
             self._rate_actions[interval] = act
+
+        # ── 保存/加载窗口配置 ──
+        vm.addSeparator()
+        self.act_save_cfg = QAction("💾 保存窗口配置", self)
+        self.act_save_cfg.triggered.connect(self._on_save_config)
+        vm.addAction(self.act_save_cfg)
+        self.act_load_cfg = QAction("📂 加载窗口配置", self)
+        self.act_load_cfg.triggered.connect(self._on_load_config)
+        vm.addAction(self.act_load_cfg)
 
         # ── 光标菜单 ──
         cm = mb.addMenu("光标")
@@ -2088,13 +2146,24 @@ class MainWindow(QMainWindow):
         for wf in self._waveform_plots.values():
             wf.plot_item.showGrid(x=on, y=on, alpha=alpha)
 
+    def _on_refresh_auto(self) -> None:
+        """自动模式：使用显示器刷新率作为绘制间隔。"""
+        self._refresh_auto = True
+        self._act_refresh_auto.setChecked(True)
+        for act in self._rate_actions.values():
+            act.setChecked(False)
+        interval = max(4, int(round(1000.0 / self._monitor_hz)))
+        self._refresh_interval_ms = interval
+        if self.live_timer.isActive():
+            self.live_timer.start(interval)
+
     def _on_refresh_rate(self, interval_ms: int) -> None:
-        """切换波形绘制刷新率（仅实时模式生效）"""
+        """手动选择波形绘制刷新率（仅实时模式生效）。"""
+        self._refresh_auto = False
         self._refresh_interval_ms = interval_ms
-        # 同步菜单勾选
+        self._act_refresh_auto.setChecked(False)
         for iv, act in self._rate_actions.items():
             act.setChecked(iv == interval_ms)
-        # 如果实时定时器正在运行，重启以应用新间隔
         if self.live_timer.isActive():
             self.live_timer.start(interval_ms)
 
@@ -2275,6 +2344,14 @@ class MainWindow(QMainWindow):
         is_offline = (mode == 'offline')
         for wf in self._waveform_plots.values():
             wf._offline_full_range = is_offline
+        # v3.9: 切回离线模式时恢复自动刻度
+        if is_offline:
+            for cid in self._channel_order:
+                if cid in self._plot_widgets:
+                    self._plot_widgets[cid].getPlotItem().getAxis('bottom').setTicks(None)
+                cfg = self._channels.get(cid)
+                if cfg:
+                    cfg._last_tick_key = None
 
     @Slot(str)
     def _on_protocol_changed(self, protocol: str) -> None:
@@ -2302,6 +2379,8 @@ class MainWindow(QMainWindow):
             port = self.edit_port.text()
             baud_or_ip = self.edit_baud.text()
             self.live_center.reset_capacity(self.spin_capacity.value())
+            for cfg in self._channels.values():
+                cfg._fill_phase = True  # v3.9: 重连后重新开始填充阶段
             self.receiver = ReceiverThread(mode, port, baud_or_ip)
             self.receiver.data_received.connect(self.live_center.process_data)
             self.receiver.error_occurred.connect(self._on_connection_error)
@@ -2327,7 +2406,9 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_clear_live_buffer(self) -> None:
         self.live_center.clear()
-        
+        for cfg in self._channels.values():
+            cfg._fill_phase = True
+
     @Slot(int)
     def _on_capacity_changed(self, val: int) -> None:
         self.live_center.reset_capacity(val)
@@ -2335,7 +2416,8 @@ class MainWindow(QMainWindow):
             cfg.x_initialized = False
             cfg.y_initialized_after_clear = False
             cfg.last_tracked_x = None
-            cfg.is_user_dragging = False
+            cfg._fill_phase = True
+            cfg._free_mode = False
             if cid in self._waveform_plots:
                 self._waveform_plots[cid].plot_item.vb.enableAutoRange(axis=pg.ViewBox.XAxis, enable=True)
         self._refresh_all_plots()
@@ -2504,21 +2586,28 @@ class MainWindow(QMainWindow):
         idx = self._ch_layout.count() - 1
         self._ch_layout.insertWidget(max(0, idx), panel)
         
-        # 绑定显式交互状态（仅在真实鼠标交互时中断自动追踪，忽略 resize 引发的浮点误差）
-        # v3.5.1: 联动拖拽——同一 X 组的所有通道都标记为拖拽中，避免主通道自动滚动覆盖联动窗口
-        def _on_manual_interact(*args):
-            if getattr(cfg, 'x_initialized', False):
-                cfg.is_user_dragging = True
-                g = cfg.link_group_x
-                if g > 0:
-                    for ocid in self._channel_order:
-                        if ocid != cid:
-                            ocfg = self._channels.get(ocid)
-                            if ocfg and ocfg.link_group_x == g:
-                                ocfg.is_user_dragging = True
-                
-        wf.plot_item.vb.sigRangeChangedManually.connect(_on_manual_interact)
-        panel.indicator.manual_interact.connect(_on_manual_interact)
+        # v3.9: 双击切换自由/跟踪模式（替代旧的拖拽触发）
+        _dbl_click_state = {'last': 0}
+        def _on_dbl_click_filter(obj, event):
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                now = event.timestamp()
+                if now - _dbl_click_state['last'] > 200:  # 防重复触发
+                    _dbl_click_state['last'] = now
+                    cfg._free_mode = not getattr(cfg, '_free_mode', False)
+                    # 联动组同步
+                    g = cfg.link_group_x
+                    if g > 0:
+                        for ocid in self._channel_order:
+                            if ocid != cid:
+                                ocfg = self._channels.get(ocid)
+                                if ocfg and ocfg.link_group_x == g:
+                                    ocfg._free_mode = cfg._free_mode
+                return True  # 吸收双击，不传给 pyqtgraph 的 View All
+            return False
+        _filter = QObject()
+        _filter.eventFilter = _on_dbl_click_filter
+        pw.installEventFilter(_filter)
+        cfg._dbl_filter = _filter  # 保持引用防 GC
 
         self._update_single_plot(cid)
         self._update_axis_linking()
@@ -2564,6 +2653,10 @@ class MainWindow(QMainWindow):
         cfg = self._channels[cid]
         vb = wf.plot_item.vb
 
+        # v3.9: Auto 按钮退出自由模式，恢复自动跟踪
+        cfg._free_mode = False
+        cfg._fill_phase = False
+
         is_offline = (self.current_mode == 'offline')
         AUTO_LIMIT = 1000
 
@@ -2592,25 +2685,25 @@ class MainWindow(QMainWindow):
                 x_all.append(x_clean)
                 y_by_aidx.setdefault(cc.axis_index, []).append(y_clean)
             else:
-                # 动态接收模式：从当前视口左边界开始，取最近 AUTO_LIMIT 个点
-                view_x_left = vb.viewRange()[0][0]
-                start_idx = np.searchsorted(x_clean, view_x_left)
-                if start_idx >= len(x_clean):
-                    start_idx = max(0, len(x_clean) - AUTO_LIMIT)
-                end_idx = min(start_idx + AUTO_LIMIT, len(x_clean))
-                x_all.append(x_clean[start_idx:end_idx])
-                y_by_aidx.setdefault(cc.axis_index, []).append(y_clean[start_idx:end_idx])
+                # v3.9: 动态模式 — 始终取最新 AUTO_LIMIT 个点，不依赖当前视口
+                start_idx = max(0, len(x_clean) - AUTO_LIMIT)
+                x_all.append(x_clean[start_idx:])
+                y_by_aidx.setdefault(cc.axis_index, []).append(y_clean[start_idx:])
 
         if not x_all:
             return
 
-        # ── X 轴：min/max 范围 ──
+        # ── X 轴：离线=全量范围，动态=默认 1000 span 右对齐 ──
         x_cat = np.concatenate(x_all)
-        x_min = float(x_cat.min())
-        x_max = float(x_cat.max())
-        if x_max - x_min < 1e-12:
-            x_max = x_min + 1.0
-        vb.setXRange(x_min, x_max, padding=0.02)
+        if is_offline:
+            x_min = float(x_cat.min())
+            x_max = float(x_cat.max())
+            if x_max - x_min < 1e-12:
+                x_max = x_min + 1.0
+            vb.setXRange(x_min, x_max, padding=0.02)
+        else:
+            _latest = float(x_cat.max())
+            vb.setXRange(_latest - 1000.0, _latest, padding=0)
         vb.disableAutoRange(axis=pg.ViewBox.XAxis)
 
         # ── Y 轴：每个 axis 独立计算 ──
@@ -2624,10 +2717,200 @@ class MainWindow(QMainWindow):
             if target_vb is None:
                 continue
             target_vb.setYRange(y_min, y_max, padding=0.05)
-            if cfg.auto_scale_y:
-                target_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-            else:
-                target_vb.disableAutoRange(axis=pg.ViewBox.YAxis)
+            # v3.9: Auto 按钮强制开启 Y 轴自适应
+            target_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+
+        # 同步 UI 复选框
+        cfg.auto_scale_y = True
+        panel = self._channel_panels.get(cid)
+        if panel:
+            panel.chk_auto_y.blockSignals(True)
+            panel.chk_auto_y.setChecked(True)
+            panel.chk_auto_y.blockSignals(False)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 窗口配置 保存 / 加载
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _on_save_config(self) -> None:
+        if not self._channels:
+            QMessageBox.information(self, "提示", "没有可保存的窗口配置。")
+            return
+        fp, _ = QFileDialog.getSaveFileName(self, "保存窗口配置", "wavescope_config.json",
+                                             "JSON 文件 (*.json)")
+        if not fp:
+            return
+        try:
+            data = {"version": "3.9", "channels": []}
+            for cid in self._channel_order:
+                cfg = self._channels[cid]
+                ch = {
+                    "window_name": cfg.window_name,
+                    "x_column": cfg.x_column,
+                    "link_group_x": cfg.link_group_x,
+                    "link_group_y": cfg.link_group_y,
+                    "auto_scale_y": cfg.auto_scale_y,
+                    "curves": [],
+                }
+                for cc in cfg.curves:
+                    ch["curves"].append({
+                        "y_column": cc.y_column,
+                        "color": [cc.color.red(), cc.color.green(),
+                                  cc.color.blue(), cc.alpha],
+                        "stroke_width": cc.stroke_width,
+                        "alpha": cc.alpha,
+                        "display_mode": cc.display_mode,
+                        "axis_index": cc.axis_index,
+                        "visible": getattr(cc, 'visible', True),
+                    })
+                data["channels"].append(ch)
+            with open(fp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(self, "保存成功",
+                                    f"已保存 {len(data['channels'])} 个窗口配置到:\n{fp}")
+        except OSError as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+
+    def _on_load_config(self) -> None:
+        fp, _ = QFileDialog.getOpenFileName(self, "加载窗口配置", "",
+                                             "JSON 文件 (*.json);;所有文件 (*.*)")
+        if not fp:
+            return
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            QMessageBox.critical(self, "加载失败", f"无法读取配置文件:\n{e}")
+            return
+        if not isinstance(data, dict) or "channels" not in data:
+            QMessageBox.critical(self, "格式错误", "配置文件格式不正确。")
+            return
+
+        # 清空现有窗口
+        for cid in list(self._channel_order):
+            self._delete_channel(cid)
+        self._next_channel_id = 0
+
+        # 确定数据源列
+        if self.current_mode == 'live':
+            if not self.live_center.is_loaded():
+                QMessageBox.warning(self, "提示", "动态模式下暂无数据列，配置可能无法完全恢复。")
+            cols = self.live_center.get_columns()
+        else:
+            cols = self.data_center.columns
+
+        # 重建窗口
+        for ch_data in data["channels"]:
+            cid = self._next_channel_id
+            self._next_channel_id += 1
+            cfg = ChannelConfig(cid)
+            cfg.window_name = ch_data.get("window_name", f"watch_{cid+1}")
+            cfg.x_column = ch_data.get("x_column", cols[0] if cols else "")
+            cfg.link_group_x = ch_data.get("link_group_x", 0)
+            cfg.link_group_y = ch_data.get("link_group_y", 0)
+            cfg.auto_scale_y = ch_data.get("auto_scale_y", True)
+            for i, cc_data in enumerate(ch_data.get("curves", [])):
+                cc = CurveConfig(i, color_seed=cid * 10 + i)
+                cc.y_column = cc_data.get("y_column", "")
+                rgba = cc_data.get("color", [255, 68, 68, 255])
+                cc.color = QColor(rgba[0], rgba[1], rgba[2], rgba[3] if len(rgba) > 3 else 255)
+                cc.stroke_width = cc_data.get("stroke_width", 0.5)
+                cc.alpha = cc_data.get("alpha", 255)
+                cc.display_mode = cc_data.get("display_mode", "both")
+                cc.axis_index = cc_data.get("axis_index", 0)
+                cc.visible = cc_data.get("visible", True)
+                cfg.curves.append(cc)
+            if not cfg.curves:
+                cc = CurveConfig(0, color_seed=cid * 10)
+                if len(cols) >= 2:
+                    cc.y_column = cols[1]
+                cfg.curves.append(cc)
+            self._channels[cid] = cfg
+            self._channel_order.append(cid)
+
+            # 创建 PlotWidget + WaveformPlot
+            pw = pg.PlotWidget(axisItems={
+                'bottom': LShapeAxis(orientation='bottom'),
+                'left': LShapeAxis(orientation='left'),
+            })
+            bg = self.PLOT_THEME[self._current_theme]["bg"]
+            pw.setBackground(bg)
+            pw.setStyleSheet("PlotWidget { border:none; }")
+            pi = pw.getPlotItem()
+            pi.hideButtons()
+            show_grid = self.act_grid.isChecked()
+            alpha = self.PLOT_THEME[self._current_theme]["grid_alpha"]
+            pi.showGrid(x=show_grid, y=show_grid, alpha=alpha)
+            pi.layout.setContentsMargins(15, 15, 25, 15)
+            pi.getAxis('left').setWidth(None)
+            pi.getAxis('bottom').setHeight(24)
+            wf = WaveformPlot(pi)
+            wf._offline_full_range = (self.current_mode == 'offline')
+            self._waveform_plots[cid] = wf
+            self._plot_widgets[cid] = pw
+
+            if not self._wheel_hook_installed:
+                self._wheel_hook_installed = True
+                scene = pw.plotItem.scene()
+                scene._orig_wheel = scene.wheelEvent
+                scene.wheelEvent = self._global_wheel
+
+            self._cursor_mgr.register_plot(cid, wf)
+
+            sub = QMdiSubWindow()
+            sub.setWidget(pw)
+            sub.setWindowTitle(cfg.window_name)
+            sub.setWindowFlags(Qt.WindowType.SubWindow | Qt.WindowType.FramelessWindowHint)
+            sub.setWindowIcon(QIcon())
+            sub.resize(650, 350)
+            sub.setMinimumSize(300, 180)
+            sub.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            def on_close(event, c=cid):
+                self._delete_channel(c)
+            sub.closeEvent = on_close
+            self._mdi.addSubWindow(sub)
+            sub.show()
+            self._channel_subs[cid] = sub
+
+            # 控制面板
+            panel = ChannelControlPanel(cid, cfg, cols)
+            panel.config_changed.connect(self._on_channel_config_changed)
+            panel.link_changed.connect(self._on_link_changed)
+            panel.delete_requested.connect(self._on_delete_channel)
+            panel.auto_requested.connect(self._on_auto_requested)
+            panel.add_indicator(wf)
+            self._channel_panels[cid] = panel
+            idx = self._ch_layout.count() - 1
+            self._ch_layout.insertWidget(max(0, idx), panel)
+
+            # 双击切换自由模式
+            _dbl_state = {'last': 0}
+            def _dbl_filter(obj, event):
+                if event.type() == QEvent.Type.MouseButtonDblClick:
+                    now = event.timestamp()
+                    if now - _dbl_state['last'] > 200:
+                        _dbl_state['last'] = now
+                        cfg._free_mode = not getattr(cfg, '_free_mode', False)
+                        g = cfg.link_group_x
+                        if g > 0:
+                            for ocid in self._channel_order:
+                                if ocid != cid:
+                                    ocfg = self._channels.get(ocid)
+                                    if ocfg and ocfg.link_group_x == g:
+                                        ocfg._free_mode = cfg._free_mode
+                    return True
+                return False
+            _filter = QObject()
+            _filter.eventFilter = _dbl_filter
+            pw.installEventFilter(_filter)
+            cfg._dbl_filter = _filter
+
+        self._smart_layout()
+        self._update_axis_linking()
+        for cid in self._channel_order:
+            self._update_single_plot(cid)
+        QMessageBox.information(self, "加载成功",
+                                f"已恢复 {len(data['channels'])} 个窗口配置。")
 
     def _delete_channel(self, cid: int) -> None:
         """删除一个波形窗口（控制面板按钮或子窗口关闭按钮触发）"""
@@ -2887,86 +3170,109 @@ class MainWindow(QMainWindow):
         if len(xd) == 0:
             wf.clear_all(); return
 
-        valid_x = xd[np.isfinite(xd)]
-        if len(valid_x) > 0:
-            # isfinite 已过滤 NaN/Inf，直接 .min()/.max() 比 nanmin/nanmax 更快
+        # v3.9: 动态模式下 x 是单调时间索引 (float32)，永远 finite，跳过 isfinite 全量扫描
+        if live_update:
+            _xd_finite = True
+            latest_x = float(xd[-1])
+            global_min_x = float(xd[0])
+            global_max_x = float(xd[-1])
+        else:
+            _xd_finite = False
+            valid_x = xd[np.isfinite(xd)]
+            if len(valid_x) == 0:
+                return
             global_min_x = float(valid_x.min())
             global_max_x = float(valid_x.max())
-            # 移除拖动边界限制，允许自由平移
-            wf.plot_item.vb.setLimits(xMin=None, xMax=None)
 
-            if live_update:
-                latest_x = float(valid_x[-1])
+        # 移除拖动边界限制，允许自由平移
+        wf.plot_item.vb.setLimits(xMin=None, xMax=None)
+
+        if live_update:
+            _free = getattr(cfg, '_free_mode', False)
+            panel = self._channel_panels.get(cid)
+
+            # ── v3.9: 两阶段 X 轴跟踪 —— 填充期 span 随数据增长，1000 点后锁定滚动 ──
+            _GROW_CAP = 1000.0
+            data_range = latest_x - global_min_x
+            in_fill = getattr(cfg, '_fill_phase', True) and not _free
+
+            if in_fill:
+                # 填充阶段：左边界锚定原点，span 随数据量增长（最小 100，最大 _GROW_CAP）
+                span = max(100.0, data_range)
+                if span >= _GROW_CAP:
+                    span = _GROW_CAP
+                    cfg._fill_phase = False  # 填满，切到滚动阶段
+                left = global_min_x
+            elif _free:
+                # v3.9: 自由模式 — 只读视口，不 setXRange，滚轮缩放完全由 pyqtgraph 接管
+                _cr = wf.plot_item.vb.viewRect()
+                left = _cr.left()
+                span = _cr.width()
+                if span <= 0:
+                    span = _GROW_CAP
+            else:
+                # 自动跟踪：span 继承当前视口，右边缘追踪最新数据
                 current_rect = wf.plot_item.vb.viewRect()
                 span = current_rect.width()
                 if span <= 0:
-                    span = 1000.0
+                    span = _GROW_CAP
                 elif span > self.live_center.capacity:
                     span = float(self.live_center.capacity)
-                    
-                right_edge = current_rect.right()
-                is_user_dragging = getattr(cfg, 'is_user_dragging', False)
-                
-                # --- 智能滚轮缩放判定 ---
-                old_span = getattr(cfg, '_last_tick_span', span)
-                cfg._last_tick_span = span
-                was_tracking = getattr(cfg, '_was_tracking', True)
-                
-                # 如果 span 发生了明显变化（超过 1%），说明用户触发了纯粹的缩放
-                is_zooming = abs(span - old_span) > (span * 0.01)
-                
-                if was_tracking and is_zooming:
-                    # 如果刚才在自动追踪，且正在缩放时间轴，强制恢复追踪
-                    # 从而拦截并修正主画板底层 WheelEvent 错误触发的拖拽暂停状态
-                    is_user_dragging = False
-                    cfg.is_user_dragging = False
-                
-                panel = self._channel_panels.get(cid)
-                indicator_held = getattr(panel.indicator, '_dragging', False) if panel else False
-                # v3.5.1: 联动组内其他通道的 indicator 正在拖拽时，本通道也视为被 hold，防止误恢复自动滚动
-                if not indicator_held and cfg.link_group_x > 0:
-                    for ocid in self._channel_order:
-                        if ocid != cid:
-                            ocfg = self._channels.get(ocid)
-                            if ocfg and ocfg.link_group_x == cfg.link_group_x:
-                                opanel = self._channel_panels.get(ocid)
-                                if opanel and getattr(opanel.indicator, '_dragging', False):
-                                    indicator_held = True
-                                    break
+                left = latest_x - span
 
-                # 恢复自动滚动阈值：放宽高频下的捕捉范围（视口 10% 或至少 2000 个点，防止跑得太快抓不到）
-                catch_threshold = max(span * 0.1, 2000.0)
-                if is_user_dragging and not indicator_held and right_edge >= latest_x - catch_threshold:
-                    is_user_dragging = False
-                    cfg.is_user_dragging = False
-                    
-                cfg._was_tracking = not is_user_dragging
-                
-                # 兜底：如果用户拖拽后停留在某处，但该处的数据已经被环形缓冲区完全淘汰（落后于最老数据）
-                # 为了防止显示一片空白，强制将其推到缓冲区最尾部
-                if is_user_dragging and right_edge < global_min_x:
-                    wf.plot_item.vb.setXRange(global_min_x, global_min_x + span, padding=0)
-                    cfg.last_tracked_x = global_min_x + span
-                elif not is_user_dragging:
-                    wf.plot_item.vb.setXRange(latest_x - span, latest_x, padding=0)
-                    cfg.last_tracked_x = latest_x
-            else:
-                # 第一次初始化 X 轴范围
-                if not getattr(cfg, 'x_initialized', False):
-                    if self.current_mode == 'live':
-                        first_x = float(valid_x[0])
-                        wf.plot_item.vb.setXRange(first_x, first_x + 1000, padding=0)
+            # 仅在跟踪/填充模式下修改视口，自由模式不干预
+            if not _free:
+                wf.plot_item.vb.setXRange(left, left + span, padding=0)
+                cfg.last_tracked_x = latest_x
+
+            # ── v3.9: 默认 1000-span 自动滚动时手动网格（标签静止），用户缩放后切回自动 ──
+            _at_default_span = abs(span - _GROW_CAP) < 5.0
+            if not getattr(cfg, '_fill_phase', True) and not _free and _at_default_span:
+                _tick_step = 200.0
+                _first = np.ceil(left / _tick_step) * _tick_step
+                _last  = np.floor((left + span) / _tick_step) * _tick_step
+                _ticks = []
+                _v = _first
+                while _v <= _last + 1.0:
+                    _ticks.append((_v, str(int(_v))))
+                    _v += _tick_step
+                _tick_key = int(_first)
+                if _tick_key != getattr(cfg, '_last_tick_key', None):
+                    wf.plot_item.getAxis('bottom').setTicks([_ticks])
+                    cfg._last_tick_key = _tick_key
+            elif getattr(cfg, '_last_tick_key', None) is not None:
+                wf.plot_item.getAxis('bottom').setTicks(None)
+                cfg._last_tick_key = None
+
+            # ── v3.9: 视口切片索引只算一次，所有曲线复用 ──
+            v_rect = wf.plot_item.vb.viewRect()
+            vw = v_rect.width()
+            left_b = v_rect.left() - vw * 0.5
+            right_b = v_rect.right() + vw * 0.5
+            _live_si = np.searchsorted(xd, left_b)
+            _live_ei = np.searchsorted(xd, right_b, side='right')
+        else:
+            # 第一次初始化 X 轴范围
+            if not getattr(cfg, 'x_initialized', False):
+                if self.current_mode == 'live':
+                    first_x = float(valid_x[0])
+                    # v3.9: 初始 span=100，填充阶段会随数据增长到 1000
+                    wf.plot_item.vb.setXRange(first_x, first_x + 100.0, padding=0)
+                else:
+                    first_x = float(valid_x[0])
+                    limit = min(1000, len(valid_x) - 1)
+                    last_x = float(valid_x[limit])
+                    if last_x > first_x:
+                        wf.plot_item.vb.setXRange(first_x, last_x, padding=0)
                     else:
-                        # 静态模式：默认显示前 1000 个点，用户可自由拖拽/缩放浏览全量
-                        first_x = float(valid_x[0])
-                        limit = min(1000, len(valid_x) - 1)
-                        last_x = float(valid_x[limit])
-                        if last_x > first_x:
-                            wf.plot_item.vb.setXRange(first_x, last_x, padding=0)
-                        else:
-                            wf.plot_item.vb.setXRange(first_x - 1, first_x + 1, padding=0)
-                    wf.plot_item.vb.disableAutoRange(axis=pg.ViewBox.XAxis)
-                    cfg.x_initialized = True
+                        wf.plot_item.vb.setXRange(first_x - 1, first_x + 1, padding=0)
+                wf.plot_item.vb.disableAutoRange(axis=pg.ViewBox.XAxis)
+                cfg.x_initialized = True
+
+        # ── v3.9: 预分配降采样缓冲区，避免每曲线每帧 np.empty ──
+        _ds_x_buf = getattr(wf, '_ds_x_buf', None)
+        _ds_y_buf = getattr(wf, '_ds_y_buf', None)
+        _DS_TARGET = 4000
 
         curves_full_data: list[tuple[np.ndarray, np.ndarray]] = []
         for cc in cfg.curves:
@@ -2976,61 +3282,47 @@ class MainWindow(QMainWindow):
                 yd = self.live_center.get_column_data(cc.y_column)
             else:
                 yd = self.data_center.get_column_data(cc.y_column)
-            # 收集 (xd, yd_full)，避免后面游标循环再次从 buffer 拉取
             curves_full_data.append((xd, yd))
 
-            if self.current_mode == 'live':
-                # 动态模式：数据无限增长，按视口切片 + 峰值降采样
-                v_rect = wf.plot_item.vb.viewRect()
-                vw = v_rect.width()
-                left_b = v_rect.left() - vw * 0.5
-                right_b = v_rect.right() + vw * 0.5
+            if live_update:
+                # v3.9: 复用外层预计算的切片索引，避免每曲线重复 searchsorted
+                if _live_si < _live_ei:
+                    sliced_x = xd[_live_si:_live_ei]
+                    sliced_y = yd[_live_si:_live_ei]
 
-                start_idx = np.searchsorted(xd, left_b)
-                end_idx = np.searchsorted(xd, right_b, side='right')
-
-                if start_idx < end_idx:
-                    sliced_x = xd[start_idx:end_idx]
-                    sliced_y = yd[start_idx:end_idx]
-
-                    # --- 极限 NumPy 峰值降采样优化 ---
-                    n_points = len(sliced_x)
+                    n_points = _live_ei - _live_si
                     if n_points > 10000:
-                        target_pts = 4000
-                        chunk_size = n_points // target_pts
-                        trunc_len = chunk_size * target_pts
+                        chunk_size = n_points // _DS_TARGET
+                        trunc_len = chunk_size * _DS_TARGET
 
-                        sx_2d = sliced_x[:trunc_len].reshape(target_pts, chunk_size)
-                        sy_2d = sliced_y[:trunc_len].reshape(target_pts, chunk_size)
+                        sx_2d = sliced_x[:trunc_len].reshape(_DS_TARGET, chunk_size)
+                        sy_2d = sliced_y[:trunc_len].reshape(_DS_TARGET, chunk_size)
 
-                        y_max = sy_2d.max(axis=1)
-                        y_min = sy_2d.min(axis=1)
-                        x_mid = sx_2d[:, 0]
-
-                        final_x = np.empty(target_pts * 2, dtype=np.float32)
-                        final_x[0::2] = x_mid
-                        final_x[1::2] = x_mid + 1e-6
-
-                        final_y = np.empty(target_pts * 2, dtype=np.float32)
-                        final_y[0::2] = y_min
-                        final_y[1::2] = y_max
+                        # 复用预分配缓冲区
+                        if _ds_x_buf is None or len(_ds_x_buf) != _DS_TARGET * 2:
+                            _ds_x_buf = np.empty(_DS_TARGET * 2, dtype=np.float32)
+                            _ds_y_buf = np.empty(_DS_TARGET * 2, dtype=np.float32)
+                            wf._ds_x_buf = _ds_x_buf
+                            wf._ds_y_buf = _ds_y_buf
+                        _ds_x_buf[0::2] = sx_2d[:, 0]
+                        _ds_x_buf[1::2] = sx_2d[:, 0] + 1e-6
+                        _ds_y_buf[0::2] = sy_2d.min(axis=1)
+                        _ds_y_buf[1::2] = sy_2d.max(axis=1)
 
                         if trunc_len < n_points:
-                            rem_x = sliced_x[trunc_len:]
-                            rem_y = sliced_y[trunc_len:]
-                            sliced_x = np.concatenate((final_x, rem_x))
-                            sliced_y = np.concatenate((final_y, rem_y))
+                            sliced_x = np.concatenate((_ds_x_buf, sliced_x[trunc_len:]))
+                            sliced_y = np.concatenate((_ds_y_buf, sliced_y[trunc_len:]))
                         else:
-                            sliced_x = final_x
-                            sliced_y = final_y
+                            sliced_x = _ds_x_buf
+                            sliced_y = _ds_y_buf
                 else:
                     sliced_x = xd
                     sliced_y = yd
 
-                wf.set_curve_data(cc, sliced_x, sliced_y)
+                # v3.9: validated=True 跳过 isfinite 扫描，数据已知 clean
+                wf.set_curve_data(cc, sliced_x, sliced_y, validated=True)
             else:
                 # 静态模式：设全量数据，pyqtgraph 内置 auto-downsample (peak)
-                # 负责按像素宽度降采样，拖拽/缩放时 GPU 级实时更新
                 wf.set_curve_data(cc, xd, yd)
 
         wf.sync_curves(cfg.curves, fg)
@@ -3062,14 +3354,13 @@ class MainWindow(QMainWindow):
         if curves_full_data:
             self._cursor_mgr.set_plot_data(cid, curves_full_data)
 
-        # 更新指示器（复用已计算的 valid_x min/max，避免重复 nanmin/nanmax）
+        # 更新指示器（v3.9: 复用已计算的 global_min_x / global_max_x，避免重复扫描）
         panel = self._channel_panels.get(cid)
         if panel and hasattr(panel, 'indicator'):
-            if len(valid_x) > 0:
-                ratio = 1.0
-                if self.current_mode == 'live' and self.live_center.capacity > 0:
-                    ratio = min(1.0, len(valid_x) / self.live_center.capacity)
-                panel.indicator.set_global_bounds(float(valid_x.min()), float(valid_x.max()), ratio)
+            ratio = 1.0
+            if live_update and self.live_center.capacity > 0:
+                ratio = min(1.0, len(xd) / self.live_center.capacity)
+            panel.indicator.set_global_bounds(global_min_x, global_max_x, ratio)
             panel.indicator.update()
 
         # 强制所有 ViewBox（含辅助轴）立即刷新
