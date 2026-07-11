@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 ================================================================================
@@ -1158,12 +1157,19 @@ class ChannelControlPanel(QGroupBox):
         def _init_auto_range():
             if not getattr(self, '_wf', None): return
             self._init_pending = False
+            is_offline = getattr(wf, '_offline_full_range', False)
             for vb in wf._vbs.values():
-                vb.setAutoVisible(x=False, y=True)
-                if self._cfg.auto_scale_y:
-                    vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-                else:
+                # v3.9: 静态 CSV 模式下不启用 Y 轴自动可见和自动缩放，
+                # 避免 setAutoVisible 在 X 轴缩放时错误地收窄 Y 轴范围导致曲线消失。
+                if is_offline:
+                    vb.setAutoVisible(x=False, y=False)
                     vb.disableAutoRange(axis=pg.ViewBox.YAxis)
+                else:
+                    vb.setAutoVisible(x=False, y=True)
+                    if self._cfg.auto_scale_y:
+                        vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+                    else:
+                        vb.disableAutoRange(axis=pg.ViewBox.YAxis)
 
         # 延迟初始化，避免在 ViewBox 尺寸为 0x0 时触发 autoRange 导致内部矩阵 NaN 进而永久失效
         QTimer.singleShot(100, _init_auto_range)
