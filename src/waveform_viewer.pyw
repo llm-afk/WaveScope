@@ -3177,6 +3177,7 @@ class MainWindow(QMainWindow):
             wf.clear_all(); return
 
         # v3.9: 动态模式下 x 是单调时间索引 (float32)，永远 finite，跳过 isfinite 全量扫描
+        _sort_order = None  # v3.9-fix: 静态模式下可能需要排序，动态模式天然有序
         if live_update:
             _xd_finite = True
             latest_x = float(xd[-1])
@@ -3189,6 +3190,14 @@ class MainWindow(QMainWindow):
                 return
             global_min_x = float(valid_x.min())
             global_max_x = float(valid_x.max())
+
+            # v3.9-fix: 静态模式下，若 x 轴数据非单调递增（如使用数据列作为 X 轴），
+            # 需要按 x 值排序，否则：1) 折线会来回跳跃导致混乱 2) setClipToView
+            # 依赖二分查找会导致放大时曲线消失。Index 列天然单调递增所以无此问题。
+            _sort_order = None
+            if len(xd) > 1 and not np.all(np.diff(xd[np.isfinite(xd)]) >= 0):
+                _sort_order = np.argsort(xd)
+                xd = xd[_sort_order]
 
         # 移除拖动边界限制，允许自由平移
         wf.plot_item.vb.setLimits(xMin=None, xMax=None)
@@ -3265,9 +3274,10 @@ class MainWindow(QMainWindow):
                     # v3.9: 初始 span=100，填充阶段会随数据增长到 1000
                     wf.plot_item.vb.setXRange(first_x, first_x + 100.0, padding=0)
                 else:
-                    first_x = float(valid_x[0])
-                    limit = min(1000, len(valid_x) - 1)
-                    last_x = float(valid_x[limit])
+                    first_x = global_min_x
+                    # v3.9-fix: 使用排序后的 xd 获取初始视口右边界
+                    limit = min(1000, len(xd) - 1)
+                    last_x = float(xd[limit])
                     if last_x > first_x:
                         wf.plot_item.vb.setXRange(first_x, last_x, padding=0)
                     else:
@@ -3288,6 +3298,9 @@ class MainWindow(QMainWindow):
                 yd = self.live_center.get_column_data(cc.y_column)
             else:
                 yd = self.data_center.get_column_data(cc.y_column)
+                # v3.9-fix: 静态模式下应用 x 排序到 y 数据
+                if _sort_order is not None:
+                    yd = yd[_sort_order]
             curves_full_data.append((xd, yd))
 
             if live_update:
